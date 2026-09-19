@@ -1,17 +1,174 @@
-from struct import pack
+"""
+taken alot of stuff from sys-hidplus's python folder and restructured it into a more user-friendly GUI 
+for parsec users to easily connect their PC gamepads to the switch 
+without needing to mess with command line tools or other stff
+"""
+
+from struct import pack, unpack, calcsize
 import socket
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 from time import sleep, time
 import os 
+import json
 import pygame 
+import cv2
+import numpy as np
+from mss import mss
+import sounddevice as sd
+import platform
 
-"""
-taken alot of stuff from sys-hidplus's python folder and restructured it into a more user-friendly GUI 
-for parsec users to easily connect their PC gamepads to the switch 
-without needing to mess with command line tools or other stff
-"""
+try:
+    import pygetwindow as gw
+except ImportError:
+    gw = None
+
+# i hate optimization and yu dont even need parsec at thi point flmfao
+
+class HostAudioStream:
+    def __init__(self, client_ip, audio_port=9002, channels=2):
+        self.client_address = (client_ip, audio_port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.channels = channels
+        self.is_running = False
+        self.stream = None
+
+    def start(self):
+        self.is_running = True
+
+        def callback(indata, frames, time_info, status):
+            if not self.is_running:
+                return
+            try:
+                # Convert float32 [-1.0, 1.0] to int16 PCM
+                pcm_data = (indata * 32767).astype(np.int16).tobytes()
+                self.sock.sendto(pcm_data, self.client_address)
+            except Exception:
+                pass
+
+        try:
+            device_idx = None
+            extra_settings = None
+            current_os = platform.system()
+
+            if current_os == "Darwin":
+                devices = sd.query_devices()
+                for idx, dev in enumerate(devices):
+                    if dev['max_input_channels'] > 0 and any(name in dev['name'] for name in ["BlackHole", "Soundflower"]):
+                        device_idx = idx
+                        break
+                if device_idx is None:
+                    device_idx = sd.default.device[0]
+
+            elif current_os == "Windows":
+                out_device_idx = sd.default.device[1]
+                if out_device_idx != -1:
+                    device_idx = out_device_idx
+                    extra_settings = sd.WasapiSettings(exclusive=False, loopback=True)
+                else:
+                    device_idx = sd.default.device[0]
+            else:
+                device_idx = sd.default.device[0]
+
+            device_info = sd.query_devices(device_idx)
+            native_sr = int(device_info['default_samplerate'])
+            channels_to_use = min(self.channels, device_info['max_input_channels']) or 1
+
+            # blocksize=256 reduces latency down to ~5ms at 48kHz
+            self.stream = sd.InputStream(
+                device=device_idx,
+                samplerate=native_sr,
+                channels=channels_to_use,
+                dtype='float32',
+                callback=callback,
+                blocksize=256,
+                latency='low',
+                extra_settings=extra_settings
+            )
+            self.stream.start()
+            print("[Host Audio] Low-latency capture started.")
+
+        except Exception as e:
+            print(f"[Host Audio Startup Error] {e}")
+
+    def stop(self):
+        self.is_running = False
+        if self.stream:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            finally:
+                self.stream = None
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+        
+class HostVideoStream:
+    def __init__(self, client_ip, video_port=9001, gui_ref=None):
+        self.client_address = (client_ip, video_port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.is_running = False
+        self.gui_ref = gui_ref
+
+    def start(self):
+        self.is_running = True
+        threading.Thread(target=self._stream_loop, daemon=True).start()
+
+    def stop(self):
+        self.is_running = False
+
+    def _create_placeholder_frame(self):
+        img = np.zeros((540, 960, 3), dtype=np.uint8)
+        text = "Host is doing something right now..."
+        
+        # Center the text on screen
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 1.0
+        thickness = 2
+        text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+        text_x = (960 - text_size[0]) // 2
+        text_y = (540 + text_size[1]) // 2
+        
+        cv2.putText(img, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        return img
+
+    def _stream_loop(self):
+        chunk_size = 1400  
+        with mss() as sct:
+            while self.is_running:
+                try:
+                    # Check if stream is paused/hidden by host
+                    if self.gui_ref and not self.gui_ref.show_screen_var.get():
+                        frame = self._create_placeholder_frame()
+                    else:
+                        monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+                        sct_img = sct.grab(monitor)
+                        
+                        frame = np.array(sct_img, dtype=np.uint8)
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                        frame = cv2.resize(frame, (960, 540))
+                    
+                    _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 45])
+                    raw_data = buffer.tobytes()
+
+                    total_size = len(raw_data)
+                    num_chunks = (total_size + chunk_size - 1) // chunk_size
+                    frame_id = int(time() * 1000) % 65536
+
+                    for idx in range(num_chunks):
+                        start_idx = idx * chunk_size
+                        chunk = raw_data[start_idx:start_idx + chunk_size]
+                        header = pack("!HBB", frame_id, num_chunks, idx)
+                        self.sock.sendto(header + chunk, self.client_address)
+
+                    sleep(1 / 30.0) 
+                except Exception as e:
+                    print(f"[VideoStream Error] {e}")
+                    sleep(0.1)
 
 class SwitchConnection:
     MAGIC_NUMBER = 0x3276
@@ -75,7 +232,6 @@ class SwitchConnection:
     def _send_packet(self):
         if not self.server_address: return
         
-        # tell sys-hidplus how many controllers to look for
         packet_data = [self.MAGIC_NUMBER, self.active_count]
         
         with self.lock:
@@ -86,8 +242,9 @@ class SwitchConnection:
         try:
             packet = pack(self.PACKET_FORMAT, *packet_data)
             self.sock.sendto(packet, self.server_address)
-        except:
+        except Exception:
             pass
+
 
 class VirtualController:
     BUTTONS = {
@@ -144,20 +301,22 @@ class VirtualController:
 
 
 class SmashParsecGUI:
+    CONFIG_FILE = "keybinds.json"
+
     PYGAME_BUTTON_MAP = {
-        0: 1,       # A (Xbox A)
-        1: 1 << 1,  # B (Xbox B)
-        2: 1 << 2,  # X (Xbox X)
-        3: 1 << 3,  # Y (Xbox Y)
-        4: 1 << 11, # MINUS (Xbox Share/Select)
-        6: 1 << 10, # PLUS (Xbox Menu/Start)
+        0: 1,       # A
+        1: 1 << 1,  # B
+        2: 1 << 2,  # X
+        3: 1 << 3,  # Y
+        4: 1 << 11, # MINUS
+        6: 1 << 10, # PLUS
         7: 1 << 4,  # LST
         8: 1 << 5,  # RST
         9: 1 << 6,  # L
         10: 1 << 7, # R
     }
 
-    KEYBOARD_MAP = {
+    DEFAULT_KEYBOARD_MAP = {
         'j': 1,         # A
         'k': 1 << 1,    # B
         'u': 1 << 2,    # X
@@ -174,32 +333,42 @@ class SmashParsecGUI:
         'p': 1 << 9,    # ZR
     }
 
-    KEYBOARD_STICK_MAP = {
+    DEFAULT_KEYBOARD_STICK_MAP = {
         'w': ('ly', 1),   
         's': ('ly', -1),  
         'a': ('lx', -1),  
         'd': ('lx', 1),   
+        'i': ('ry', 1),   
+        'k': ('ry', -1),  
+        'j': ('rx', -1),  
+        'l': ('rx', 1),   
     }
     
     STICK_SENSITIVITY = 32767
 
     def __init__(self, root):
         self.root = root
-        self.root.title("parsec 2 switch tool")
-        self.root.geometry("890x570") 
+        self.root.title("online switch tool")
+        self.root.geometry("890x620") 
         
         pygame.init()
         pygame.joystick.init()
         
+        self.KEYBOARD_MAP = dict(self.DEFAULT_KEYBOARD_MAP)
+        self.KEYBOARD_STICK_MAP = dict(self.DEFAULT_KEYBOARD_STICK_MAP)
+        self._load_keybinds_json()
+
         self.switch_conn = None
         self.controllers = {}
         self.num_players = 4 
         self.port_vars = {}
         self.active_joysticks = {}
         
-        # network for clients !
         self.data_lock = threading.Lock()
         self.network_clients = {}
+        self.video_streamers = {}  # {client_ip: HostVideoStream}
+        self.audio_streamers = {} # {client_ip: HostAudioStream}
+
         self.client_listener_sock = None
         self.listen_for_clients = False
 
@@ -214,39 +383,91 @@ class SmashParsecGUI:
         
         self.root.after(10, self._poll_hardware_events)
 
+    def _load_keybinds_json(self):
+        if os.path.exists(self.CONFIG_FILE):
+            try:
+                with open(self.CONFIG_FILE, 'r') as f:
+                    data = json.load(f)
+                    if "buttons" in data:
+                        self.KEYBOARD_MAP = {k: int(v) for k, v in data["buttons"].items()}
+                    if "sticks" in data:
+                        self.KEYBOARD_STICK_MAP = {k: tuple(v) for k, v in data["sticks"].items()}
+            except Exception as e:
+                print(f"Error loading {self.CONFIG_FILE}: {e}")
+
+    def _save_keybinds_json(self):
+        try:
+            data = {
+                "buttons": self.KEYBOARD_MAP,
+                "sticks": {k: list(v) for k, v in self.KEYBOARD_STICK_MAP.items()}
+            }
+            with open(self.CONFIG_FILE, 'w') as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            print(f"Error saving {self.CONFIG_FILE}: {e}")
+
     def _start_client_listener(self):
-        # udp packets from clients to us :>
-        # we take those packets and translate them
-        #  to data which then our app sends to the switch
         self.client_listener_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             self.client_listener_sock.bind(("0.0.0.0", 9000))
             self.listen_for_clients = True
             threading.Thread(target=self._receive_client_packets, daemon=True).start()
+            threading.Thread(target=self._client_cleanup_loop, daemon=True).start()
         except Exception as e:
             print(f"Could not bind client receiver port: {e}")
 
     def _receive_client_packets(self):
-        from struct import calcsize, unpack
         fmt = "<32sIiiii"
         while self.listen_for_clients:
             try:
                 data, addr = self.client_listener_sock.recvfrom(1024)
+                client_ip = addr[0]
                 if len(data) == calcsize(fmt):
-                    # Its a player! Set them up for the app to use
                     raw_name, buttons, lx, ly, rx, ry = unpack(fmt, data)
                     user_str = raw_name.decode('utf-8', errors='ignore').strip('\x00').strip()
-                    
                     client_label = f"[Net] {user_str}"
                     
                     with self.data_lock:
                         self.network_clients[client_label] = {
-                            "buttons": buttons, "lx": lx, "ly": ly, "rx": rx, "ry": ry, "last_seen": time()
+                            "buttons": buttons, "lx": lx, "ly": ly, "rx": rx, "ry": ry, 
+                            "last_seen": time(), "client_ip": client_ip
                         }
-            except:
-                # most likey corrupted data or something else talking to our port
-                # either way its not important so ignore it.
+
+                        if client_ip not in self.video_streamers:
+                            streamer = HostVideoStream(client_ip=client_ip, video_port=9001, gui_ref=self)
+                            streamer.start()
+                            self.video_streamers[client_ip] = streamer
+
+                        if client_ip not in self.audio_streamers:
+                            a_streamer = HostAudioStream(client_ip=client_ip, audio_port=9002)
+                            a_streamer.start()
+                            self.audio_streamers[client_ip] = a_streamer
+
+                    assigned_port = 0
+                    for port_idx, port_data in self.port_vars.items():
+                        if port_data["gamepad_source"].get() == client_label:
+                            assigned_port = port_idx
+                            break
+
+                    try:
+                        self.client_listener_sock.sendto(bytes([assigned_port]), addr)
+                    except Exception:
+                        pass
+            except Exception:
                 pass
+
+    def _client_cleanup_loop(self):
+        while True:
+            now = time()
+            with self.data_lock:
+                for client_label, info in list(self.network_clients.items()):
+                    if now - info["last_seen"] > 4.0:
+                        client_ip = info["client_ip"]
+                        if client_ip in self.video_streamers:
+                            self.video_streamers[client_ip].stop()
+                            del self.video_streamers[client_ip]
+                        del self.network_clients[client_label]
+            sleep(1.0)
 
     def _load_icon(self):
         img_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pro_controller.png")
@@ -263,7 +484,6 @@ class SmashParsecGUI:
     def set_connection(self, ip):
         self.switch_conn = SwitchConnection(ip)
         self.switch_conn.start(ip, active_count=self.num_players) 
-        
         self.controllers = {i: VirtualController(self.switch_conn, i) for i in range(1, self.num_players + 1)}
         
         for controller in self.controllers.values():
@@ -272,7 +492,7 @@ class SmashParsecGUI:
 
     def _build_ui(self):
         self.ip_frame = ttk.LabelFrame(self.root, text="Connect Options", padding=10)
-        self.ip_frame.pack(fill="x", padx=15, pady=10)
+        self.ip_frame.pack(fill="x", padx=15, pady=5)
         
         ttk.Label(self.ip_frame, text="Switch IP:").pack(side="left", padx=2)
         self.ip_entry = ttk.Entry(self.ip_frame, width=14)
@@ -285,7 +505,6 @@ class SmashParsecGUI:
         self.player_count_dropdown.pack(side="left", padx=2)
         self.player_count_dropdown.bind("<<ComboboxSelected>>", self._on_player_count_changed)
 
-        # unstable warning label for 5+ controllers
         self.warning_lbl = tk.Label(self.ip_frame, text="⚠️ 5+ Players can be unstable", fg="darkorange", font=("TkDefaultFont", 9, "bold"))
         self.warning_lbl.pack_forget()
 
@@ -295,6 +514,19 @@ class SmashParsecGUI:
         self.kbd_btn = ttk.Button(self.ip_frame, text="Configure Keyboard", command=self._open_keyboard_config)
         self.kbd_btn.pack(side="left", padx=5)
 
+        self.show_screen_var = tk.BooleanVar(value=False)
+        self.stream_frame = ttk.LabelFrame(self.root, text="Stream Controls", padding=10)
+        self.stream_frame.pack(fill="x", padx=15, pady=5)
+
+        self.toggle_stream_btn = ttk.Checkbutton(
+            self.stream_frame, 
+            text="Show Screen to Clients", 
+            variable=self.show_screen_var
+        )
+        self.toggle_stream_btn.pack(side="left", padx=5)
+        
+   
+
         self.container_frame = ttk.Frame(self.root)
         self.container_frame.pack(fill="both", expand=True, padx=15, pady=5)
 
@@ -302,18 +534,13 @@ class SmashParsecGUI:
         self.scrollbar = ttk.Scrollbar(self.container_frame, orient="vertical", command=self.canvas.yview)
         self.routing_frame = ttk.LabelFrame(self.canvas, text="Assign Gamepads (Connect to configure)", padding=10)
         
-        self.routing_frame.bind(
-            "<Configure>", 
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
-        
+        self.routing_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas_window = self.canvas.create_window((0, 0), window=self.routing_frame, anchor="nw")
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
         
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
 
-        self.routing_frame.bind('<Configure>', lambda event: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.root.bind('<Configure>', lambda event: self.canvas.itemconfig(self.canvas_window, width=self.canvas.winfo_width()))
 
         footer = ttk.Frame(self.root, padding=5)
@@ -324,20 +551,21 @@ class SmashParsecGUI:
         self.status_lbl.pack(side="left", padx=15)
 
         self.info_frame = ttk.LabelFrame(self.root, text="Over the internet guide:", padding=10)
-        self.info_frame.pack(fill="x", padx=15, pady=(5, 15), side="bottom")
+        self.info_frame.pack(fill="x", padx=15, pady=(5, 10), side="bottom")
         
         instructions_text = (
             "This app is automatically running on port 9000.\n"
-            "You might have to do some port forwarding before you friends may connect.\n"
+            "You might have to do some port forwarding before your friends may connect.\n"
             "Once they do connect, select their username and enjoy!"
         )
         self.info_lbl = ttk.Label(self.info_frame, text=instructions_text, justify="left", foreground="gray")
         self.info_lbl.pack(fill="x")
 
+
     def _open_keyboard_config(self):
         config_win = tk.Toplevel(self.root)
         config_win.title("Keyboard Layout Configuration")
-        config_win.geometry("400x550")
+        config_win.geometry("400x600")
         config_win.grab_set()
 
         canvas = tk.Canvas(config_win, borderwidth=0, highlightthickness=0)
@@ -360,7 +588,9 @@ class SmashParsecGUI:
         }
         stick_labels = {
             'ly_1': ("Left Stick Up", 'ly', 1), 'ly_-1': ("Left Stick Down", 'ly', -1),
-            'lx_-1': ("Left Stick Left", 'lx', -1), 'lx_1': ("Left Stick Right", 'lx', 1)
+            'lx_-1': ("Left Stick Left", 'lx', -1), 'lx_1': ("Left Stick Right", 'lx', 1),
+            'ry_1': ("Right Stick Up", 'ry', 1), 'ry_-1': ("Right Stick Down", 'ry', -1),
+            'rx_-1': ("Right Stick Left", 'rx', -1), 'rx_1': ("Right Stick Right", 'rx', 1)
         }
 
         entries = {}
@@ -384,6 +614,7 @@ class SmashParsecGUI:
                             del self.KEYBOARD_MAP[k]
                     self.KEYBOARD_MAP[new_key] = target_key
                 
+                self._save_keybinds_json()
                 entries[target_key].config(text=new_key)
                 entries[target_key].unbind("<Key>")
                 return "break"
@@ -427,7 +658,7 @@ class SmashParsecGUI:
             widget.destroy()
             
         self.port_vars.clear()
-        self.routing_frame.config(text=f"Assign gamepads")
+        self.routing_frame.config(text="Assign gamepads")
 
         for i in range(1, self.num_players + 1):
             row = ttk.Frame(self.routing_frame, padding=5)
@@ -438,7 +669,7 @@ class SmashParsecGUI:
                 img_lbl.pack(side="left", padx=(5, 15))
             
             ttk.Label(row, text=f"Controller {i}:", width=15).pack(side="left")
-            ttk.Label(row, text="Assign controller:").pack(side="left", padx=10)
+            ttk.Label(row, text="Assign gamepad:").pack(side="left", padx=10)
             
             gamepad_choice_var = tk.StringVar()
             dropdown = ttk.Combobox(row, textvariable=gamepad_choice_var, values=["None Connected"], width=25, state="readonly")
@@ -451,9 +682,6 @@ class SmashParsecGUI:
             }
 
     def _refresh_pc_joysticks(self):
-        pygame.joystick.quit()
-        pygame.joystick.init()
-        
         count = pygame.joystick.get_count()
         joystick_names = ["None Assigned", "Keyboard"]
         self.active_joysticks.clear()
@@ -461,11 +689,12 @@ class SmashParsecGUI:
         for i in range(count):
             try:
                 j = pygame.joystick.Joystick(i)
-                j.init()
+                if not j.get_init():
+                    j.init()
                 name_str = f"ID {i}: {j.get_name()[:15]}"
                 joystick_names.append(name_str)
                 self.active_joysticks[name_str] = j
-            except:
+            except Exception:
                 pass
 
         now = time()
@@ -501,7 +730,7 @@ class SmashParsecGUI:
             self.set_connection(ip)
             
             self.conn_btn.config(text="Disconnect")
-            self.status_lbl.config(text=f"Cconnected to {ip} :)", foreground="green")
+            self.status_lbl.config(text=f"Connected to {ip} :)", foreground="green")
         else:
             if self.switch_conn:
                 self.switch_conn.stop()
@@ -552,7 +781,7 @@ class SmashParsecGUI:
             self._update_keyboard_sticks()
     
     def _update_keyboard_sticks(self):
-        lx, ly = 0, 0
+        lx, ly, rx, ry = 0, 0, 0, 0
         for key in self.pressed_keys:
             if key in self.KEYBOARD_STICK_MAP:
                 axis, multiplier = self.KEYBOARD_STICK_MAP[key]
@@ -560,24 +789,30 @@ class SmashParsecGUI:
                     lx += multiplier * self.STICK_SENSITIVITY
                 elif axis == 'ly':
                     ly += multiplier * self.STICK_SENSITIVITY
+                elif axis == 'rx':
+                    rx += multiplier * self.STICK_SENSITIVITY
+                elif axis == 'ry':
+                    ry += multiplier * self.STICK_SENSITIVITY
 
         lx = max(-32767, min(32767, lx))
         ly = max(-32767, min(32767, ly))
+        rx = max(-32767, min(32767, rx))
+        ry = max(-32767, min(32767, ry))
 
         for p_num in range(1, self.num_players + 1):
             if p_num in self.port_vars and self.port_vars[p_num]["gamepad_source"].get() == "Keyboard":
                 v_con = self.controllers[p_num]
-                v_con.lx = lx
-                v_con.ly = ly
+                v_con.lx, v_con.ly = lx, ly
+                v_con.rx, v_con.ry = rx, ry
                 v_con._push()
 
     def _poll_hardware_events(self):
         pygame.event.pump()
         
-        if int(time() * 10) % 8 == 0:
-            self._refresh_pc_joysticks()
-
         if self.switch_conn is not None and self.switch_conn.is_running:
+            with self.data_lock:
+                network_clients_snapshot = dict(self.network_clients)
+
             for switch_port in range(1, self.num_players + 1):
                 if switch_port not in self.port_vars: 
                     continue
@@ -587,9 +822,7 @@ class SmashParsecGUI:
                     continue
 
                 if "[Net] " in selected_name:
-                    with self.data_lock:
-                        has_client = selected_name in self.network_clients
-                        client_data = self.network_clients.get(selected_name) if has_client else None
+                    client_data = network_clients_snapshot.get(selected_name)
                     
                     if client_data:
                         v_con = self.controllers[switch_port]
@@ -608,15 +841,24 @@ class SmashParsecGUI:
                 joy = self.active_joysticks[selected_name]
                 v_con = self.controllers[switch_port]
                 
+                if not joy.get_init():
+                    try:
+                        joy.init()
+                    except Exception:
+                        continue
+
                 current_mask = 0
                 for pygame_idx, switch_bit in self.PYGAME_BUTTON_MAP.items():
                     if pygame_idx < joy.get_numbuttons() and joy.get_button(pygame_idx):
                         current_mask |= switch_bit
-                        
-                if joy.get_numaxes() >= 5:
+                
+                num_axes = joy.get_numaxes()
+                if num_axes >= 6:
                     if joy.get_axis(2) > 0.4: current_mask |= (1 << 8)   # ZL
                     if joy.get_axis(5) > 0.4: current_mask |= (1 << 9)   # ZR
-                    
+                elif num_axes >= 3:
+                    if joy.get_axis(2) > 0.4: current_mask |= (1 << 8)
+
                 if joy.get_numhats() > 0:
                     hat_x, hat_y = joy.get_hat(0)
                     if hat_y == 1:  current_mask |= (1 << 13) # DU
@@ -627,16 +869,21 @@ class SmashParsecGUI:
                 v_con.buttons_state = current_mask
                 
                 lx, ly, rx, ry = 0, 0, 0, 0
-                if joy.get_numaxes() >= 4:
+                if num_axes >= 2:
                     lx = int(joy.get_axis(0) * 32767)
                     ly = int(-joy.get_axis(1) * 32767)
+                
+                if num_axes >= 5:
                     rx = int(joy.get_axis(3) * 32767)
                     ry = int(-joy.get_axis(4) * 32767)
-                    
-                    if abs(lx) < 4500: lx = 0
-                    if abs(ly) < 4500: ly = 0
-                    if abs(rx) < 4500: rx = 0
-                    if abs(ry) < 4500: ry = 0
+                elif num_axes >= 4:
+                    rx = int(joy.get_axis(2) * 32767)
+                    ry = int(-joy.get_axis(3) * 32767)
+
+                if abs(lx) < 4500: lx = 0
+                if abs(ly) < 4500: ly = 0
+                if abs(rx) < 4500: rx = 0
+                if abs(ry) < 4500: ry = 0
 
                 v_con.set_sticks(lx, ly, rx, ry)
 
@@ -655,4 +902,6 @@ if __name__ == "__main__":
             app.switch_conn.stop()
         if app.client_listener_sock:
             app.client_listener_sock.close()
+        for streamer in app.video_streamers.values():
+            streamer.stop()
         pygame.quit()

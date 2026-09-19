@@ -2,47 +2,116 @@ import socket
 import struct
 import threading
 import time
+import os
+import json
+import io
 import tkinter as tk
 from tkinter import messagebox, ttk
 import pygame
+from PIL import Image, ImageTk
+import sounddevice as sd
+import numpy as np
+
 
 class ParsecToSwitchClient:
     CLIENT_PACKET_FORMAT = "<32sIiiii" 
+    CONFIG_FILE = "keybinds.json"
+    VIDEO_PORT = 9001
+    AUDIO_PORT = 9002
+
+    DEFAULT_KEYBOARD_MAP = {
+        'j': 1, 'k': 1<<1, 'u': 1<<2, 'i': 1<<3, 'q': 1<<11, 'e': 1<<10,
+        'Up': 1<<13, 'Down': 1<<15, 'Left': 1<<12, 'Right': 1<<14,
+        'l': 1<<6, 'r': 1<<7, 'o': 1<<8, 'p': 1<<9
+    }
+    DEFAULT_KEYBOARD_STICK_MAP = {
+        'w': ('ly', 1), 's': ('ly', -1), 'a': ('lx', -1), 'd': ('lx', 1),
+        'i': ('ry', 1), 'k': ('ry', -1), 'j': ('rx', -1), 'l': ('rx', 1)
+    }
 
     def __init__(self, root):
         self.root = root
-        self.root.title("switch 2 parsec tool - client")
-        self.root.geometry("420x360")
+        self.root.title("online switch tool - client")
+        self.root.geometry("880x580")
+
+        self.current_pil_image = None
+        self.latest_photo = None
         
         pygame.init()
         pygame.joystick.init()
         
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.video_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.video_sock.bind(("0.0.0.0", self.VIDEO_PORT))
+        self.video_sock.settimeout(0.5)
+
+        self.audio_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.audio_sock.bind(("0.0.0.0", self.AUDIO_PORT))
+        self.audio_sock.settimeout(2.0)
+        
         self.is_running = False
         self.network_thread = None
+        self.video_thread = None
+        self.audio_thread = None
+        self.slot_listen_thread = None
+        self.assigned_slot = "Unassigned"
         
         self.pressed_keys = set()
         self.buttons_state = 0
         self.lx, self.ly, self.rx, self.ry = 0, 0, 0, 0
         
         self.PYGAME_BUTTON_MAP = {0: 1, 1: 1<<1, 2: 1<<2, 3: 1<<3, 4: 1<<11, 6: 1<<10, 7: 1<<4, 8: 1<<5, 9: 1<<6, 10: 1<<7}
-        self.KEYBOARD_MAP = {'j': 1, 'k': 1<<1, 'u': 1<<2, 'i': 1<<3, 'q': 1<<11, 'e': 1<<10, 'Up': 1<<13, 'Down': 1<<15, 'Left': 1<<12, 'Right': 1<<14, 'l': 1<<6, 'r': 1<<7, 'o': 1<<8, 'p': 1<<9}
-        self.KEYBOARD_STICK_MAP = {'w': ('ly', 1), 's': ('ly', -1), 'a': ('lx', -1), 'd': ('lx', 1)}
+        
+        self.KEYBOARD_MAP = dict(self.DEFAULT_KEYBOARD_MAP)
+        self.KEYBOARD_STICK_MAP = dict(self.DEFAULT_KEYBOARD_STICK_MAP)
+        self._load_keybinds_json()
 
-        self._build_ui()
+        self.drawer_visible = False
+        self.animating_drawer = False
+        self.drawer_width = 240
+
+        self._build_main_ui()
+        self._build_connected_ui()
+        self._build_side_drawer()
+
         self.root.bind("<KeyPress>", self._on_key_press)
         self.root.bind("<KeyRelease>", self._on_key_release)
+        self.root.bind("<Escape>", self._toggle_side_drawer)
+
         self.root.after(10, self._poll_input)
 
-    def _build_ui(self):
-        frame = ttk.LabelFrame(self.root, text="Options", padding=10)
-        frame.pack(fill="both", expand=True, padx=15, pady=15)
+    def _load_keybinds_json(self):
+        if os.path.exists(self.CONFIG_FILE):
+            try:
+                with open(self.CONFIG_FILE, 'r') as f:
+                    data = json.load(f)
+                    if "buttons" in data:
+                        self.KEYBOARD_MAP = {k: int(v) for k, v in data["buttons"].items()}
+                    if "sticks" in data:
+                        self.KEYBOARD_STICK_MAP = {k: tuple(v) for k, v in data["sticks"].items()}
+            except Exception as e:
+                print(f"Error reading {self.CONFIG_FILE}: {e}")
 
-        ttk.Label(frame, text="Username (Leave blank for Device Name):").pack(anchor="w", pady=2)
-        self.user_entry = ttk.Entry(frame)
+    def _save_keybinds_json(self):
+        try:
+            data = {
+                "buttons": self.KEYBOARD_MAP,
+                "sticks": {k: list(v) for k, v in self.KEYBOARD_STICK_MAP.items()}
+            }
+            with open(self.CONFIG_FILE, 'w') as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            print(f"Error saving {self.CONFIG_FILE}: {e}")
+
+    def _build_main_ui(self):
+        self.main_menu_frame = ttk.LabelFrame(self.root, text="Options", padding=10)
+        self.main_menu_frame.pack(fill="both", expand=True, padx=15, pady=15)
+
+        ttk.Label(self.main_menu_frame, text="Username (Leave blank for Device Name):").pack(anchor="w", pady=2)
+        self.user_entry = ttk.Entry(self.main_menu_frame)
         self.user_entry.pack(fill="x", pady=5)
 
-        ip_row = ttk.Frame(frame)
+        ip_row = ttk.Frame(self.main_menu_frame)
         ip_row.pack(fill="x", pady=5)
 
         ip_col = ttk.Frame(ip_row)
@@ -59,12 +128,12 @@ class ParsecToSwitchClient:
         self.port_entry.insert(0, "9000")
         self.port_entry.pack(side="left")
 
-        ttk.Label(frame, text="Device to capture").pack(anchor="w", pady=2)
+        ttk.Label(self.main_menu_frame, text="Device to capture").pack(anchor="w", pady=2)
         self.source_var = tk.StringVar(value="Keyboard")
-        self.source_dropdown = ttk.Combobox(frame, textvariable=self.source_var, state="readonly")
+        self.source_dropdown = ttk.Combobox(self.main_menu_frame, textvariable=self.source_var, state="readonly")
         self.source_dropdown.pack(fill="x", pady=5)
 
-        btn_row = ttk.Frame(frame)
+        btn_row = ttk.Frame(self.main_menu_frame)
         btn_row.pack(fill="x", pady=10)
 
         self.conn_btn = ttk.Button(btn_row, text="Connect to Host", command=self._toggle_connection)
@@ -73,9 +142,66 @@ class ParsecToSwitchClient:
         self.kbd_btn = ttk.Button(btn_row, text="Configure Keyboard", command=self._open_keyboard_config)
         self.kbd_btn.pack(side="right", padx=(5, 0))
         
-        self.status_lbl = ttk.Label(frame, text="Status: Disconnected", foreground="gray")
+        self.status_lbl = ttk.Label(self.main_menu_frame, text="Status: Disconnected", foreground="gray")
         self.status_lbl.pack(anchor="s", pady=5)
         
+        self._refresh_sources()
+
+    def _audio_receive_loop(self):
+        sample_rate = 48000
+        out_stream = None
+        current_channels = None
+
+        self.audio_sock.settimeout(0.005)
+
+        while self.is_running:
+            try:
+                latest_packet = None
+                
+                while True:
+                    try:
+                        packet, _ = self.audio_sock.recvfrom(8192)
+                        latest_packet = packet
+                    except socket.timeout:
+                        break
+
+                if latest_packet:
+                    audio_data = np.frombuffer(latest_packet, dtype=np.int16)
+                    num_samples = len(audio_data)
+                    
+                    detected_channels = max(1, num_samples // 256)
+
+                    if out_stream is None or detected_channels != current_channels:
+                        if out_stream:
+                            out_stream.stop()
+                            out_stream.close()
+
+                        current_channels = detected_channels
+                        out_stream = sd.OutputStream(
+                            samplerate=sample_rate,
+                            channels=current_channels,
+                            dtype='int16',
+                            blocksize=256,
+                            latency='low'
+                        )
+                        out_stream.start()
+
+                    if current_channels > 1:
+                        audio_data = audio_data.reshape(-1, current_channels)
+
+                    out_stream.write(audio_data)
+
+            except Exception as e:
+                pass
+
+        if out_stream:
+            try:
+                out_stream.stop()
+                out_stream.close()
+            except Exception:
+                pass
+
+    def _refresh_sources(self):
         count = pygame.joystick.get_count()
         choices = ["Keyboard"]
         for i in range(count):
@@ -85,6 +211,71 @@ class ParsecToSwitchClient:
                 choices.append(f"ID {i}: {j.get_name()[:15]}")
             except: pass
         self.source_dropdown.config(values=choices)
+
+    def _build_connected_ui(self):
+        self.connected_frame = ttk.Frame(self.root, padding=5)
+        
+        info_bar = ttk.Frame(self.connected_frame)
+        info_bar.pack(fill="x", pady=(0, 5))
+
+        self.conn_info_lbl = ttk.Label(info_bar, text="", font=("TkDefaultFont", 10, "bold"), foreground="#2b8c2b")
+        self.conn_info_lbl.pack(side="left", padx=5)
+
+        self.ping_lbl = ttk.Label(info_bar, text="Ping: -- ms", font=("Arial", 11))
+        self.ping_lbl.pack(side="right", pady=5)
+
+        self.video_canvas = tk.Label(self.connected_frame, text="Connecting & waiting for video stream...", bg="black", fg="white")
+        self.video_canvas.pack(fill="both", expand=True)
+        self.video_canvas.bind("<Configure>", self._on_canvas_resize)
+
+    def _build_side_drawer(self):
+        self.drawer_frame = ttk.Frame(self.root, relief="raised", borderwidth=2)
+        
+        title_lbl = ttk.Label(self.drawer_frame, text="Quick Settings", font=("TkDefaultFont", 11, "bold"))
+        title_lbl.pack(pady=10, padx=10, anchor="w")
+
+        ttk.Label(self.drawer_frame, text="Input Source:").pack(anchor="w", padx=10, pady=(5, 2))
+        self.drawer_source_var = tk.StringVar(value=self.source_var.get())
+        self.drawer_source_dropdown = ttk.Combobox(self.drawer_frame, textvariable=self.drawer_source_var, state="readonly", width=22)
+        self.drawer_source_dropdown.pack(padx=10, fill="x")
+        self.drawer_source_dropdown.bind("<<ComboboxSelected>>", self._on_drawer_source_change)
+
+        ttk.Button(self.drawer_frame, text="Keyboard Keybinds", command=self._open_keyboard_config).pack(padx=10, pady=15, fill="x")
+
+        ttk.Button(self.drawer_frame, text="Disconnect", command=self._toggle_connection).pack(padx=10, pady=(10, 0), fill="x", side="bottom")
+
+    def _toggle_side_drawer(self, event=None):
+        if not self.is_running or self.animating_drawer:
+            return
+
+        self.animating_drawer = True
+        target_x = self.root.winfo_width() - self.drawer_width if not self.drawer_visible else self.root.winfo_width()
+        
+        if not self.drawer_visible:
+            self._refresh_sources()
+            self.drawer_source_dropdown.config(values=self.source_dropdown["values"])
+            self.drawer_source_var.set(self.source_var.get())
+            self.drawer_frame.place(x=self.root.winfo_width(), y=0, width=self.drawer_width, height=self.root.winfo_height())
+
+        def animate(current_x):
+            step = 25 if not self.drawer_visible else -25
+            next_x = current_x - step
+            
+            if (not self.drawer_visible and next_x <= target_x) or (self.drawer_visible and next_x >= target_x):
+                self.drawer_frame.place(x=target_x, y=0, width=self.drawer_width, height=self.root.winfo_height())
+                self.drawer_visible = not self.drawer_visible
+                self.animating_drawer = False
+                if not self.drawer_visible:
+                    self.drawer_frame.place_forget()
+            else:
+                self.drawer_frame.place(x=next_x, y=0, width=self.drawer_width, height=self.root.winfo_height())
+                self.root.after(10, lambda: animate(next_x))
+
+        animate(self.root.winfo_width() if not self.drawer_visible else self.root.winfo_width() - self.drawer_width)
+
+    def _on_drawer_source_change(self, event):
+        new_val = self.drawer_source_var.get()
+        self.source_var.set(new_val)
 
     def _open_keyboard_config(self):
         config_win = tk.Toplevel(self.root)
@@ -112,7 +303,9 @@ class ParsecToSwitchClient:
         }
         stick_labels = {
             'ly_1': ("Left Stick Up", 'ly', 1), 'ly_-1': ("Left Stick Down", 'ly', -1),
-            'lx_-1': ("Left Stick Left", 'lx', -1), 'lx_1': ("Left Stick Right", 'lx', 1)
+            'lx_-1': ("Left Stick Left", 'lx', -1), 'lx_1': ("Left Stick Right", 'lx', 1),
+            'ry_1': ("Right Stick Up", 'ry', 1), 'ry_-1': ("Right Stick Down", 'ry', -1),
+            'rx_-1': ("Right Stick Left", 'rx', -1), 'rx_1': ("Right Stick Right", 'rx', 1)
         }
 
         entries = {}
@@ -136,6 +329,7 @@ class ParsecToSwitchClient:
                             del self.KEYBOARD_MAP[k]
                     self.KEYBOARD_MAP[new_key] = target_key
                 
+                self._save_keybinds_json()
                 entries[target_key].config(text=new_key)
                 entries[target_key].unbind("<Key>")
                 return "break"
@@ -185,25 +379,96 @@ class ParsecToSwitchClient:
             self.host_address = (host_ip, dest_port)
             self.is_running = True
             
-            self.user_entry.config(state="disabled")
-            self.ip_entry.config(state="disabled")
-            self.port_entry.config(state="disabled")
-            self.source_dropdown.config(state="disabled")
-            self.conn_btn.config(text="Disconnect")
-            self.status_lbl.config(text=f"streaming to {self.ip_entry.get()} as '{self.final_username}'", foreground="green")
-            
+            self.main_menu_frame.pack_forget()
+            self.conn_info_lbl.config(text=f"Connected: {host_ip}:{dest_port}")
+            self.connected_frame.pack(fill="both", expand=True)
+
             self.network_thread = threading.Thread(target=self._network_loop, daemon=True)
             self.network_thread.start()
+
+            self.video_thread = threading.Thread(target=self._video_receive_loop, daemon=True)
+            self.video_thread.start()
+
+            self.audio_thread = threading.Thread(target=self._audio_receive_loop, daemon=True)
+            self.audio_thread.start()
         else:
             self.is_running = False
-            if self.network_thread:
-                self.network_thread.join()
-            self.user_entry.config(state="normal")
-            self.ip_entry.config(state="normal")
-            self.port_entry.config(state="normal")
-            self.source_dropdown.config(state="readonly")
-            self.conn_btn.config(text="Connect")
-            self.status_lbl.config(text="Disconnected", foreground="gray")
+            if self.network_thread: self.network_thread.join()
+            if self.audio_thread: self.audio_thread.join()
+            
+            self.drawer_frame.place_forget()
+            self.drawer_visible = False
+            self.animating_drawer = False
+
+            self.connected_frame.pack_forget()
+            self.main_menu_frame.pack(fill="both", expand=True, padx=15, pady=15)
+            self.status_lbl.config(text="Status: Disconnected", foreground="gray")
+
+    def _video_receive_loop(self):
+        chunks = {}
+        current_frame_id = -1
+
+        while self.is_running:
+            try:
+                packet, _ = self.video_sock.recvfrom(65535)
+                if len(packet) < 4: continue
+
+                frame_id, total_chunks, chunk_idx = struct.unpack("!HBB", packet[:4])
+                payload = packet[4:]
+
+                if frame_id != current_frame_id:
+                    current_frame_id = frame_id
+                    chunks = {}
+
+                chunks[chunk_idx] = payload
+
+                if len(chunks) == total_chunks:
+                    full_image_data = b"".join([chunks[i] for i in range(total_chunks)])
+                    image = Image.open(io.BytesIO(full_image_data))
+
+                    self.root.after(0, self._update_video_frame, image)
+                    chunks = {}
+            except socket.timeout:
+                continue
+            except Exception:
+                pass
+
+    def _update_video_frame(self, pil_image):
+        if not self.is_running:
+            return
+
+        self.current_pil_image = pil_image
+        self._render_scaled_frame()
+
+    def _on_canvas_resize(self, event):
+        if self.is_running and self.current_pil_image:
+            self._render_scaled_frame()
+
+    def _render_scaled_frame(self):
+        if not self.current_pil_image:
+            return
+
+        width = self.video_canvas.winfo_width()
+        height = self.video_canvas.winfo_height()
+
+        if width <= 1 or height <= 1:
+            return
+
+        img_w, img_h = self.current_pil_image.size
+        aspect_ratio = img_w / img_h
+
+        if width / height > aspect_ratio:
+            new_h = height
+            new_w = int(height * aspect_ratio)
+        else:
+            new_w = width
+            new_h = int(width / aspect_ratio)
+
+        scaled_img = self.current_pil_image.resize((new_w, new_h), Image.Resampling.BILINEAR)
+        self.latest_photo = ImageTk.PhotoImage(scaled_img)
+
+        self.video_canvas.config(image=self.latest_photo, text="")
+        self.video_canvas.image = self.latest_photo
 
     def _on_key_press(self, event):
         if self.source_var.get() != "Keyboard": return
@@ -225,14 +490,19 @@ class ParsecToSwitchClient:
             self._update_keyboard_sticks()
 
     def _update_keyboard_sticks(self):
-        self.lx, self.ly = 0, 0
+        self.lx, self.ly, self.rx, self.ry = 0, 0, 0, 0
         for key in self.pressed_keys:
             if key in self.KEYBOARD_STICK_MAP:
                 axis, mult = self.KEYBOARD_STICK_MAP[key]
                 if axis == 'lx': self.lx += mult * 32767
                 elif axis == 'ly': self.ly += mult * 32767
+                elif axis == 'rx': self.rx += mult * 32767
+                elif axis == 'ry': self.ry += mult * 32767
+
         self.lx = max(-32767, min(32767, self.lx))
         self.ly = max(-32767, min(32767, self.ly))
+        self.rx = max(-32767, min(32767, self.rx))
+        self.ry = max(-32767, min(32767, self.ry))
 
     def _poll_input(self):
         pygame.event.pump()
@@ -242,36 +512,30 @@ class ParsecToSwitchClient:
             try:
                 joy_id = int(selected.split("ID ")[1].split(":")[0])
                 
-                # CACHE FIX: Check if we already have this joystick initialized
                 if not hasattr(self, 'joystick') or self.joystick.get_id() != joy_id:
                     self.joystick = pygame.joystick.Joystick(joy_id)
                     self.joystick.init()
                 
                 joy = self.joystick
-                
                 mask = 0
                 num_buttons = joy.get_numbuttons()
                 for p_idx, bit in self.PYGAME_BUTTON_MAP.items():
                     if p_idx < num_buttons and joy.get_button(p_idx):
                         mask |= bit
                 
-                # Check axes safely
                 num_axes = joy.get_numaxes()
-                
-                # ZL / ZR Triggers 
                 if num_axes >= 6:
-                    if joy.get_axis(2) > 0.4: mask |= (1 << 8)  # ZL
-                    if joy.get_axis(5) > 0.4: mask |= (1 << 9)  # ZR
+                    if joy.get_axis(2) > 0.4: mask |= (1 << 8)
+                    if joy.get_axis(5) > 0.4: mask |= (1 << 9)
                 elif num_axes >= 3:
                     if joy.get_axis(2) > 0.4: mask |= (1 << 8)
 
-                # D-Pad (Hats)
                 if joy.get_numhats() > 0:
                     hx, hy = joy.get_hat(0)
-                    if hy == 1:  mask |= (1 << 13)   # Up
-                    if hy == -1: mask |= (1 << 15)   # Down
-                    if hx == -1: mask |= (1 << 12)   # Left
-                    if hx == 1:  mask |= (1 << 14)   # Right
+                    if hy == 1:  mask |= (1 << 13)
+                    if hy == -1: mask |= (1 << 15)
+                    if hx == -1: mask |= (1 << 12)
+                    if hx == 1:  mask |= (1 << 14)
                 
                 self.buttons_state = mask
                 
@@ -282,7 +546,7 @@ class ParsecToSwitchClient:
                 if num_axes >= 5:
                     self.rx = int(joy.get_axis(3) * 32767)
                     self.ry = int(-joy.get_axis(4) * 32767)
-                elif num_axes >= 4: # Fallback mapping
+                elif num_axes >= 4:
                     self.rx = int(joy.get_axis(2) * 32767)
                     self.ry = int(-joy.get_axis(3) * 32767)
 
@@ -292,7 +556,6 @@ class ParsecToSwitchClient:
                 if abs(self.ry) < 4500: self.ry = 0
                 
             except Exception as e:
-                print(f"Joystick polling error: {e}")
                 pass
 
         self.root.after(10, self._poll_input)
@@ -300,10 +563,14 @@ class ParsecToSwitchClient:
     def _network_loop(self):
         while self.is_running:
             try:
-                # pack everything into one!
+                start_time = time.perf_counter()
                 encoded_name = self.final_username.encode('utf-8')
                 packet = struct.pack(self.CLIENT_PACKET_FORMAT, encoded_name, self.buttons_state, self.lx, self.ly, self.rx, self.ry)
                 self.sock.sendto(packet, self.host_address)
+                end_time = time.perf_counter()
+                ping_ms = round((end_time - start_time) * 1000)
+
+                self.root.after(0, lambda p=ping_ms: self.ping_lbl.config(text=f"Ping: {p} ms"))
             except: pass
             time.sleep(1 / 60.0)
 

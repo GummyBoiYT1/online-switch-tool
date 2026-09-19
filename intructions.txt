@@ -5,11 +5,14 @@ This tool is for you!
 REQUIRED:
 | Modded Switch with custom firmware
 | sys-hidplus installed in said switch
-| Python, and all modules in requirements
-| A game that supports 4 or more players
+
+| Python, and all modules in requirements (install pip install pygame pillow sounddevice numpy opencv-python mss pygetwindow)
+| Or if theres an .exe just run main
+
+| A switch game that supports 4 or more players
 
 OPTIONAL:
-| A way to stream your switch stream to your friends.
+| A way to stream your switch stream to your friends, so the desktop streamer can capture the switch
 | SysDVR is great for this (with required patches)
 
 INSTRUCTIONS:
@@ -19,19 +22,17 @@ INSTRUCTIONS:
 | click connect.
 | in a few seconds all the controllers will connect to your switch.
 | set your friends controllers to the virtual switch controllers
+
+| Fair Warning: the client will share your entire desktop. Check the box if you dont want that to happen.
+
 | Enjoy!
 
 NOTICABLE PROBLEMS:
 | If your wi-fi isnt all that good, your guests will have input lag. Thats it.
-| 5+ controllers gets unstable. frequent disconnects and sometimes breaks sys-hidplus and you will have to restart.
+| 5+ controllers gets unstable. frequent disconnects and sometimes breaks sys-hidplus and you will have to restart your nintendo switch.
 | Closing the app without clicking 'Disconnect' will not remove all the controllers. Use the disconnect button when stopping your play session.
 
-FOR NETWORKING:
-| The app is hosted on port 9000. You can change that by editing main.py but i wouldnt recommend it.
-| On the client all you need to do is connect via IP and Port and the host will have to map your name into the controller they would like you to use.
-| Enjoy!
-
-Keyboard mappings (can be remapped):
+Keyboard mappings:
 WASD - move
 j - A Button
 k - B Button
@@ -44,3 +45,8 @@ l - L Button
 r = R Button
 o = ZL Button
 p = ZR Button
+
+
+GummyBoiYT
+
+idk how to compile shit

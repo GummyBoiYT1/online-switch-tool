@@ -1,0 +1,1 @@
+isnt used, but can store custom keybinds just replace the real keybinds.json with whatever is here lol
