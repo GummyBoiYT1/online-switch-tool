@@ -34,6 +34,7 @@ INSTRUCTIONS:
 
 | Run main.py from your terminal (or exe if you have it)
 
+| Port forward UDP 9000 9001 and 9002
 | Add how many players you would like to run with the options
 
 | click connect.
