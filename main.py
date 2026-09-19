@@ -13,162 +13,12 @@ from time import sleep, time
 import os 
 import json
 import pygame 
-import cv2
-import numpy as np
-from mss import mss
-import sounddevice as sd
 import platform
 
 try:
     import pygetwindow as gw
 except ImportError:
     gw = None
-
-# i hate optimization and yu dont even need parsec at thi point flmfao
-
-class HostAudioStream:
-    def __init__(self, client_ip, audio_port=9002, channels=2):
-        self.client_address = (client_ip, audio_port)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.channels = channels
-        self.is_running = False
-        self.stream = None
-
-    def start(self):
-        self.is_running = True
-
-        def callback(indata, frames, time_info, status):
-            if not self.is_running:
-                return
-            try:
-                # Convert float32 [-1.0, 1.0] to int16 PCM
-                pcm_data = (indata * 32767).astype(np.int16).tobytes()
-                self.sock.sendto(pcm_data, self.client_address)
-            except Exception:
-                pass
-
-        try:
-            device_idx = None
-            extra_settings = None
-            current_os = platform.system()
-
-            if current_os == "Darwin":
-                devices = sd.query_devices()
-                for idx, dev in enumerate(devices):
-                    if dev['max_input_channels'] > 0 and any(name in dev['name'] for name in ["BlackHole", "Soundflower"]):
-                        device_idx = idx
-                        break
-                if device_idx is None:
-                    device_idx = sd.default.device[0]
-
-            elif current_os == "Windows":
-                out_device_idx = sd.default.device[1]
-                if out_device_idx != -1:
-                    device_idx = out_device_idx
-                    extra_settings = sd.WasapiSettings(exclusive=False, loopback=True)
-                else:
-                    device_idx = sd.default.device[0]
-            else:
-                device_idx = sd.default.device[0]
-
-            device_info = sd.query_devices(device_idx)
-            native_sr = int(device_info['default_samplerate'])
-            channels_to_use = min(self.channels, device_info['max_input_channels']) or 1
-
-            # blocksize=256 reduces latency down to ~5ms at 48kHz
-            self.stream = sd.InputStream(
-                device=device_idx,
-                samplerate=native_sr,
-                channels=channels_to_use,
-                dtype='float32',
-                callback=callback,
-                blocksize=256,
-                latency='low',
-                extra_settings=extra_settings
-            )
-            self.stream.start()
-            print("[Host Audio] Low-latency capture started.")
-
-        except Exception as e:
-            print(f"[Host Audio Startup Error] {e}")
-
-    def stop(self):
-        self.is_running = False
-        if self.stream:
-            try:
-                self.stream.stop()
-                self.stream.close()
-            except Exception:
-                pass
-            finally:
-                self.stream = None
-        try:
-            self.sock.close()
-        except Exception:
-            pass
-        
-class HostVideoStream:
-    def __init__(self, client_ip, video_port=9001, gui_ref=None):
-        self.client_address = (client_ip, video_port)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.is_running = False
-        self.gui_ref = gui_ref
-
-    def start(self):
-        self.is_running = True
-        threading.Thread(target=self._stream_loop, daemon=True).start()
-
-    def stop(self):
-        self.is_running = False
-
-    def _create_placeholder_frame(self):
-        img = np.zeros((540, 960, 3), dtype=np.uint8)
-        text = "Host is doing something right now..."
-        
-        # Center the text on screen
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 1.0
-        thickness = 2
-        text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
-        text_x = (960 - text_size[0]) // 2
-        text_y = (540 + text_size[1]) // 2
-        
-        cv2.putText(img, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-        return img
-
-    def _stream_loop(self):
-        chunk_size = 1400  
-        with mss() as sct:
-            while self.is_running:
-                try:
-                    # Check if stream is paused/hidden by host
-                    if self.gui_ref and not self.gui_ref.show_screen_var.get():
-                        frame = self._create_placeholder_frame()
-                    else:
-                        monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-                        sct_img = sct.grab(monitor)
-                        
-                        frame = np.array(sct_img, dtype=np.uint8)
-                        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                        frame = cv2.resize(frame, (960, 540))
-                    
-                    _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 45])
-                    raw_data = buffer.tobytes()
-
-                    total_size = len(raw_data)
-                    num_chunks = (total_size + chunk_size - 1) // chunk_size
-                    frame_id = int(time() * 1000) % 65536
-
-                    for idx in range(num_chunks):
-                        start_idx = idx * chunk_size
-                        chunk = raw_data[start_idx:start_idx + chunk_size]
-                        header = pack("!HBB", frame_id, num_chunks, idx)
-                        self.sock.sendto(header + chunk, self.client_address)
-
-                    sleep(1 / 30.0) 
-                except Exception as e:
-                    print(f"[VideoStream Error] {e}")
-                    sleep(0.1)
 
 class SwitchConnection:
     MAGIC_NUMBER = 0x3276
@@ -231,14 +81,11 @@ class SwitchConnection:
 
     def _send_packet(self):
         if not self.server_address: return
-        
         packet_data = [self.MAGIC_NUMBER, self.active_count]
-        
         with self.lock:
             for p_id in sorted(self.slots.keys()):
                 s = self.slots[p_id]
                 packet_data.extend([s["type"], s["buttons"], s["lx"], s["ly"], s["rx"], s["ry"]])
-            
         try:
             packet = pack(self.PACKET_FORMAT, *packet_data)
             self.sock.sendto(packet, self.server_address)
@@ -304,44 +151,19 @@ class SmashParsecGUI:
     CONFIG_FILE = "keybinds.json"
 
     PYGAME_BUTTON_MAP = {
-        0: 1,       # A
-        1: 1 << 1,  # B
-        2: 1 << 2,  # X
-        3: 1 << 3,  # Y
-        4: 1 << 11, # MINUS
-        6: 1 << 10, # PLUS
-        7: 1 << 4,  # LST
-        8: 1 << 5,  # RST
-        9: 1 << 6,  # L
-        10: 1 << 7, # R
+        0: 1, 1: 1 << 1, 2: 1 << 2, 3: 1 << 3, 4: 1 << 11,
+        6: 1 << 10, 7: 1 << 4, 8: 1 << 5, 9: 1 << 6, 10: 1 << 7,
     }
 
     DEFAULT_KEYBOARD_MAP = {
-        'j': 1,         # A
-        'k': 1 << 1,    # B
-        'u': 1 << 2,    # X
-        'i': 1 << 3,    # Y
-        'q': 1 << 11,   # MINUS
-        'e': 1 << 10,   # PLUS
-        'Up': 1 << 13,  # D-Pad Up    
-        'Down': 1 << 15,# D-Pad Down  
-        'Left': 1 << 12,# D-Pad Left
-        'Right': 1 << 14,# D-Pad Right
-        'l': 1 << 6,    # L
-        'r': 1 << 7,    # R
-        'o': 1 << 8,    # ZL
-        'p': 1 << 9,    # ZR
+        'j': 1, 'k': 1 << 1, 'u': 1 << 2, 'i': 1 << 3, 'q': 1 << 11, 'e': 1 << 10,
+        'Up': 1 << 13, 'Down': 1 << 15, 'Left': 1 << 12, 'Right': 1 << 14,
+        'l': 1 << 6, 'r': 1 << 7, 'o': 1 << 8, 'p': 1 << 9,
     }
 
     DEFAULT_KEYBOARD_STICK_MAP = {
-        'w': ('ly', 1),   
-        's': ('ly', -1),  
-        'a': ('lx', -1),  
-        'd': ('lx', 1),   
-        'i': ('ry', 1),   
-        'k': ('ry', -1),  
-        'j': ('rx', -1),  
-        'l': ('rx', 1),   
+        'w': ('ly', 1), 's': ('ly', -1), 'a': ('lx', -1), 'd': ('lx', 1),
+        't': ('ry', 1), 'g': ('ry', -1), 'f': ('rx', -1), 'h': ('rx', 1),
     }
     
     STICK_SENSITIVITY = 32767
@@ -349,7 +171,7 @@ class SmashParsecGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("online switch tool")
-        self.root.geometry("890x620") 
+        self.root.geometry("890x520") 
         
         pygame.init()
         pygame.joystick.init()
@@ -366,8 +188,6 @@ class SmashParsecGUI:
         
         self.data_lock = threading.Lock()
         self.network_clients = {}
-        self.video_streamers = {}  # {client_ip: HostVideoStream}
-        self.audio_streamers = {} # {client_ip: HostAudioStream}
 
         self.client_listener_sock = None
         self.listen_for_clients = False
@@ -379,7 +199,7 @@ class SmashParsecGUI:
         self._load_icon()
         self._build_ui()
         self._refresh_pc_joysticks()
-        self._start_client_listener()
+        self._start_client_listeners()
         
         self.root.after(10, self._poll_hardware_events)
 
@@ -406,15 +226,17 @@ class SmashParsecGUI:
         except Exception as e:
             print(f"Error saving {self.CONFIG_FILE}: {e}")
 
-    def _start_client_listener(self):
+    def _start_client_listeners(self):
+        self.listen_for_clients = True
+        
         self.client_listener_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             self.client_listener_sock.bind(("0.0.0.0", 9000))
-            self.listen_for_clients = True
             threading.Thread(target=self._receive_client_packets, daemon=True).start()
-            threading.Thread(target=self._client_cleanup_loop, daemon=True).start()
         except Exception as e:
-            print(f"Could not bind client receiver port: {e}")
+            print(f"Could not bind port 9000: {e}")
+
+        threading.Thread(target=self._client_cleanup_loop, daemon=True).start()
 
     def _receive_client_packets(self):
         fmt = "<32sIiiii"
@@ -432,16 +254,6 @@ class SmashParsecGUI:
                             "buttons": buttons, "lx": lx, "ly": ly, "rx": rx, "ry": ry, 
                             "last_seen": time(), "client_ip": client_ip
                         }
-
-                        if client_ip not in self.video_streamers:
-                            streamer = HostVideoStream(client_ip=client_ip, video_port=9001, gui_ref=self)
-                            streamer.start()
-                            self.video_streamers[client_ip] = streamer
-
-                        if client_ip not in self.audio_streamers:
-                            a_streamer = HostAudioStream(client_ip=client_ip, audio_port=9002)
-                            a_streamer.start()
-                            self.audio_streamers[client_ip] = a_streamer
 
                     assigned_port = 0
                     for port_idx, port_data in self.port_vars.items():
@@ -462,10 +274,6 @@ class SmashParsecGUI:
             with self.data_lock:
                 for client_label, info in list(self.network_clients.items()):
                     if now - info["last_seen"] > 4.0:
-                        client_ip = info["client_ip"]
-                        if client_ip in self.video_streamers:
-                            self.video_streamers[client_ip].stop()
-                            del self.video_streamers[client_ip]
                         del self.network_clients[client_label]
             sleep(1.0)
 
@@ -513,20 +321,7 @@ class SmashParsecGUI:
         
         self.kbd_btn = ttk.Button(self.ip_frame, text="Configure Keyboard", command=self._open_keyboard_config)
         self.kbd_btn.pack(side="left", padx=5)
-
-        self.show_screen_var = tk.BooleanVar(value=False)
-        self.stream_frame = ttk.LabelFrame(self.root, text="Stream Controls", padding=10)
-        self.stream_frame.pack(fill="x", padx=15, pady=5)
-
-        self.toggle_stream_btn = ttk.Checkbutton(
-            self.stream_frame, 
-            text="Show Screen to Clients", 
-            variable=self.show_screen_var
-        )
-        self.toggle_stream_btn.pack(side="left", padx=5)
         
-   
-
         self.container_frame = ttk.Frame(self.root)
         self.container_frame.pack(fill="both", expand=True, padx=15, pady=5)
 
@@ -554,13 +349,12 @@ class SmashParsecGUI:
         self.info_frame.pack(fill="x", padx=15, pady=(5, 10), side="bottom")
         
         instructions_text = (
-            "This app is automatically running on port 9000.\n"
-            "You might have to do some port forwarding before your friends may connect.\n"
-            "Once they do connect, select their username and enjoy!"
+            "This app is running on UDP port 9000 (input).\n"
+            "Forward UDP port 9000 on your router if playing over the internet.\n"
+            "Once friends connect, select their username and enjoy!"
         )
         self.info_lbl = ttk.Label(self.info_frame, text=instructions_text, justify="left", foreground="gray")
         self.info_lbl.pack(fill="x")
-
 
     def _open_keyboard_config(self):
         config_win = tk.Toplevel(self.root)
@@ -753,28 +547,24 @@ class SmashParsecGUI:
 
     def _on_keyboard_press(self, event):
         if not self.switch_conn: return
-        
         key = event.keysym if event.keysym in ['Up', 'Down', 'Left', 'Right'] else event.char
         if key in self.KEYBOARD_MAP:
             bit = self.KEYBOARD_MAP[key]
             for p_num in range(1, self.num_players + 1):
                 if p_num in self.port_vars and self.port_vars[p_num]["gamepad_source"].get() == "Keyboard":
                     self.controllers[p_num].set_button_by_bitmask(bit, True)
-                    
         elif key in self.KEYBOARD_STICK_MAP:
             self.pressed_keys.add(key)
             self._update_keyboard_sticks()
 
     def _on_keyboard_release(self, event):
         if not self.switch_conn: return
-        
         key = event.keysym if event.keysym in ['Up', 'Down', 'Left', 'Right'] else event.char
         if key in self.KEYBOARD_MAP:
             bit = self.KEYBOARD_MAP[key]
             for p_num in range(1, self.num_players + 1):
                 if p_num in self.port_vars and self.port_vars[p_num]["gamepad_source"].get() == "Keyboard":
                     self.controllers[p_num].set_button_by_bitmask(bit, False)
-                
         elif key in self.KEYBOARD_STICK_MAP:
             if key in self.pressed_keys:
                 self.pressed_keys.remove(key)
@@ -785,14 +575,10 @@ class SmashParsecGUI:
         for key in self.pressed_keys:
             if key in self.KEYBOARD_STICK_MAP:
                 axis, multiplier = self.KEYBOARD_STICK_MAP[key]
-                if axis == 'lx':
-                    lx += multiplier * self.STICK_SENSITIVITY
-                elif axis == 'ly':
-                    ly += multiplier * self.STICK_SENSITIVITY
-                elif axis == 'rx':
-                    rx += multiplier * self.STICK_SENSITIVITY
-                elif axis == 'ry':
-                    ry += multiplier * self.STICK_SENSITIVITY
+                if axis == 'lx': lx += multiplier * self.STICK_SENSITIVITY
+                elif axis == 'ly': ly += multiplier * self.STICK_SENSITIVITY
+                elif axis == 'rx': rx += multiplier * self.STICK_SENSITIVITY
+                elif axis == 'ry': ry += multiplier * self.STICK_SENSITIVITY
 
         lx = max(-32767, min(32767, lx))
         ly = max(-32767, min(32767, ly))
@@ -808,7 +594,6 @@ class SmashParsecGUI:
 
     def _poll_hardware_events(self):
         pygame.event.pump()
-        
         if self.switch_conn is not None and self.switch_conn.is_running:
             with self.data_lock:
                 network_clients_snapshot = dict(self.network_clients)
@@ -823,7 +608,6 @@ class SmashParsecGUI:
 
                 if "[Net] " in selected_name:
                     client_data = network_clients_snapshot.get(selected_name)
-                    
                     if client_data:
                         v_con = self.controllers[switch_port]
                         v_con.buttons_state = client_data["buttons"]
@@ -842,10 +626,8 @@ class SmashParsecGUI:
                 v_con = self.controllers[switch_port]
                 
                 if not joy.get_init():
-                    try:
-                        joy.init()
-                    except Exception:
-                        continue
+                    try: joy.init()
+                    except Exception: continue
 
                 current_mask = 0
                 for pygame_idx, switch_bit in self.PYGAME_BUTTON_MAP.items():
@@ -854,17 +636,17 @@ class SmashParsecGUI:
                 
                 num_axes = joy.get_numaxes()
                 if num_axes >= 6:
-                    if joy.get_axis(2) > 0.4: current_mask |= (1 << 8)   # ZL
-                    if joy.get_axis(5) > 0.4: current_mask |= (1 << 9)   # ZR
+                    if joy.get_axis(2) > 0.4: current_mask |= (1 << 8)
+                    if joy.get_axis(5) > 0.4: current_mask |= (1 << 9)
                 elif num_axes >= 3:
                     if joy.get_axis(2) > 0.4: current_mask |= (1 << 8)
 
                 if joy.get_numhats() > 0:
                     hat_x, hat_y = joy.get_hat(0)
-                    if hat_y == 1:  current_mask |= (1 << 13) # DU
-                    if hat_y == -1: current_mask |= (1 << 15) # DD
-                    if hat_x == -1: current_mask |= (1 << 12) # DL
-                    if hat_x == 1:  current_mask |= (1 << 14) # DR
+                    if hat_y == 1:  current_mask |= (1 << 13)
+                    if hat_y == -1: current_mask |= (1 << 15)
+                    if hat_x == -1: current_mask |= (1 << 12)
+                    if hat_x == 1:  current_mask |= (1 << 14)
 
                 v_con.buttons_state = current_mask
                 
@@ -872,7 +654,6 @@ class SmashParsecGUI:
                 if num_axes >= 2:
                     lx = int(joy.get_axis(0) * 32767)
                     ly = int(-joy.get_axis(1) * 32767)
-                
                 if num_axes >= 5:
                     rx = int(joy.get_axis(3) * 32767)
                     ry = int(-joy.get_axis(4) * 32767)
@@ -893,7 +674,6 @@ class SmashParsecGUI:
 if __name__ == "__main__":
     root = tk.Tk()
     app = SmashParsecGUI(root)
-    
     try:
         root.mainloop()
     finally:
@@ -902,6 +682,4 @@ if __name__ == "__main__":
             app.switch_conn.stop()
         if app.client_listener_sock:
             app.client_listener_sock.close()
-        for streamer in app.video_streamers.values():
-            streamer.stop()
         pygame.quit()

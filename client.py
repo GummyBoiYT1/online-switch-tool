@@ -4,20 +4,14 @@ import threading
 import time
 import os
 import json
-import io
 import tkinter as tk
 from tkinter import messagebox, ttk
 import pygame
-from PIL import Image, ImageTk
-import sounddevice as sd
-import numpy as np
 
 
 class ParsecToSwitchClient:
     CLIENT_PACKET_FORMAT = "<32sIiiii" 
     CONFIG_FILE = "keybinds.json"
-    VIDEO_PORT = 9001
-    AUDIO_PORT = 9002
 
     DEFAULT_KEYBOARD_MAP = {
         'j': 1, 'k': 1<<1, 'u': 1<<2, 'i': 1<<3, 'q': 1<<11, 'e': 1<<10,
@@ -32,28 +26,15 @@ class ParsecToSwitchClient:
     def __init__(self, root):
         self.root = root
         self.root.title("online switch tool - client")
-        self.root.geometry("880x580")
-
-        self.current_pil_image = None
-        self.latest_photo = None
+        self.root.geometry("480x380")
         
         pygame.init()
         pygame.joystick.init()
         
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.video_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.video_sock.bind(("0.0.0.0", self.VIDEO_PORT))
-        self.video_sock.settimeout(0.5)
-
-        self.audio_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.audio_sock.bind(("0.0.0.0", self.AUDIO_PORT))
-        self.audio_sock.settimeout(2.0)
         
         self.is_running = False
         self.network_thread = None
-        self.video_thread = None
-        self.audio_thread = None
-        self.slot_listen_thread = None
         self.assigned_slot = "Unassigned"
         
         self.pressed_keys = set()
@@ -147,60 +128,6 @@ class ParsecToSwitchClient:
         
         self._refresh_sources()
 
-    def _audio_receive_loop(self):
-        sample_rate = 48000
-        out_stream = None
-        current_channels = None
-
-        self.audio_sock.settimeout(0.005)
-
-        while self.is_running:
-            try:
-                latest_packet = None
-                
-                while True:
-                    try:
-                        packet, _ = self.audio_sock.recvfrom(8192)
-                        latest_packet = packet
-                    except socket.timeout:
-                        break
-
-                if latest_packet:
-                    audio_data = np.frombuffer(latest_packet, dtype=np.int16)
-                    num_samples = len(audio_data)
-                    
-                    detected_channels = max(1, num_samples // 256)
-
-                    if out_stream is None or detected_channels != current_channels:
-                        if out_stream:
-                            out_stream.stop()
-                            out_stream.close()
-
-                        current_channels = detected_channels
-                        out_stream = sd.OutputStream(
-                            samplerate=sample_rate,
-                            channels=current_channels,
-                            dtype='int16',
-                            blocksize=256,
-                            latency='low'
-                        )
-                        out_stream.start()
-
-                    if current_channels > 1:
-                        audio_data = audio_data.reshape(-1, current_channels)
-
-                    out_stream.write(audio_data)
-
-            except Exception as e:
-                pass
-
-        if out_stream:
-            try:
-                out_stream.stop()
-                out_stream.close()
-            except Exception:
-                pass
-
     def _refresh_sources(self):
         count = pygame.joystick.get_count()
         choices = ["Keyboard"]
@@ -224,9 +151,8 @@ class ParsecToSwitchClient:
         self.ping_lbl = ttk.Label(info_bar, text="Ping: -- ms", font=("Arial", 11))
         self.ping_lbl.pack(side="right", pady=5)
 
-        self.video_canvas = tk.Label(self.connected_frame, text="Connecting & waiting for video stream...", bg="black", fg="white")
-        self.video_canvas.pack(fill="both", expand=True)
-        self.video_canvas.bind("<Configure>", self._on_canvas_resize)
+        info_box = ttk.Label(self.connected_frame, text="Connected to Host controller server.\nUse Parsec or another tool for video/audio streaming.", justify="center", foreground="gray")
+        info_box.pack(fill="both", expand=True, pady=40)
 
     def _build_side_drawer(self):
         self.drawer_frame = ttk.Frame(self.root, relief="raised", borderwidth=2)
@@ -378,23 +304,16 @@ class ParsecToSwitchClient:
             self.final_username = username[:30] 
             self.host_address = (host_ip, dest_port)
             self.is_running = True
-            
+
             self.main_menu_frame.pack_forget()
             self.conn_info_lbl.config(text=f"Connected: {host_ip}:{dest_port}")
             self.connected_frame.pack(fill="both", expand=True)
 
             self.network_thread = threading.Thread(target=self._network_loop, daemon=True)
             self.network_thread.start()
-
-            self.video_thread = threading.Thread(target=self._video_receive_loop, daemon=True)
-            self.video_thread.start()
-
-            self.audio_thread = threading.Thread(target=self._audio_receive_loop, daemon=True)
-            self.audio_thread.start()
         else:
             self.is_running = False
             if self.network_thread: self.network_thread.join()
-            if self.audio_thread: self.audio_thread.join()
             
             self.drawer_frame.place_forget()
             self.drawer_visible = False
@@ -403,72 +322,6 @@ class ParsecToSwitchClient:
             self.connected_frame.pack_forget()
             self.main_menu_frame.pack(fill="both", expand=True, padx=15, pady=15)
             self.status_lbl.config(text="Status: Disconnected", foreground="gray")
-
-    def _video_receive_loop(self):
-        chunks = {}
-        current_frame_id = -1
-
-        while self.is_running:
-            try:
-                packet, _ = self.video_sock.recvfrom(65535)
-                if len(packet) < 4: continue
-
-                frame_id, total_chunks, chunk_idx = struct.unpack("!HBB", packet[:4])
-                payload = packet[4:]
-
-                if frame_id != current_frame_id:
-                    current_frame_id = frame_id
-                    chunks = {}
-
-                chunks[chunk_idx] = payload
-
-                if len(chunks) == total_chunks:
-                    full_image_data = b"".join([chunks[i] for i in range(total_chunks)])
-                    image = Image.open(io.BytesIO(full_image_data))
-
-                    self.root.after(0, self._update_video_frame, image)
-                    chunks = {}
-            except socket.timeout:
-                continue
-            except Exception:
-                pass
-
-    def _update_video_frame(self, pil_image):
-        if not self.is_running:
-            return
-
-        self.current_pil_image = pil_image
-        self._render_scaled_frame()
-
-    def _on_canvas_resize(self, event):
-        if self.is_running and self.current_pil_image:
-            self._render_scaled_frame()
-
-    def _render_scaled_frame(self):
-        if not self.current_pil_image:
-            return
-
-        width = self.video_canvas.winfo_width()
-        height = self.video_canvas.winfo_height()
-
-        if width <= 1 or height <= 1:
-            return
-
-        img_w, img_h = self.current_pil_image.size
-        aspect_ratio = img_w / img_h
-
-        if width / height > aspect_ratio:
-            new_h = height
-            new_w = int(height * aspect_ratio)
-        else:
-            new_w = width
-            new_h = int(width / aspect_ratio)
-
-        scaled_img = self.current_pil_image.resize((new_w, new_h), Image.Resampling.BILINEAR)
-        self.latest_photo = ImageTk.PhotoImage(scaled_img)
-
-        self.video_canvas.config(image=self.latest_photo, text="")
-        self.video_canvas.image = self.latest_photo
 
     def _on_key_press(self, event):
         if self.source_var.get() != "Keyboard": return
