@@ -16,23 +16,23 @@ REQUIRED:
 
 | sys-hidplus installed in said switch
 
-| Python, and all modules in requirements
+| Python, and all modules in requirements (install pip install pygame pillow sounddevice numpy opencv-python mss pygetwindow)
 
-| A game that supports 4 or more players
+| Or if theres an .exe just run main
+
+| A switch game that supports 4 or more players
 
 OPTIONAL:
 
-| A way to stream your switch stream to your friends.
+| A way to stream your switch stream to your friends, so the desktop streamer can capture the switch
 
 | SysDVR is great for this (with required patches)
-
-| the client, so players may send input without with their keyboards without using keyboard on your PC. or, if you're hosting on MacOS a way for players to use their gamepads
 
 INSTRUCTIONS:
 
 | Go to your Internet settings in your switch. Write down where it says 'IP Address'
 
-| Run main.py from your terminal
+| Run main.py from your terminal (or exe if you have it)
 
 | Add how many players you would like to run with the options
 
@@ -41,17 +41,21 @@ INSTRUCTIONS:
 | in a few seconds all the controllers will connect to your switch.
 
 | set your friends controllers to the virtual switch controllers
+
+| Fair Warning: the client will share your entire desktop. Check the box if you dont want that to happen.
+
 | Enjoy!
 
 NOTICABLE PROBLEMS:
 
 | If your wi-fi isnt all that good, your guests will have input lag. Thats it.
 
-| 5+ controllers gets unstable. frequent disconnects and sometimes breaks sys-hidplus and you will have to restart.
+| 5+ controllers gets unstable. frequent disconnects and sometimes breaks sys-hidplus and you will have to restart your nintendo switch.
 
 | Closing the app without clicking 'Disconnect' will not remove all the controllers. Use the disconnect button when stopping your play session.
 
-Keyboard mappings:
+
+Keyboard mappings (customizable):
 
 WASD - move
 
