@@ -24,7 +24,7 @@ REQUIRED:
 
 OPTIONAL:
 
-| A way to stream your switch stream to your friends, so the desktop streamer can capture the switch
+| A way to stream your switch stream to your friends, so players can see your game via parsec
 
 | SysDVR is great for this (with required patches)
 
